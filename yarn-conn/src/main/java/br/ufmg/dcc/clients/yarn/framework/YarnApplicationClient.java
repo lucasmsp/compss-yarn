@@ -3,7 +3,6 @@ package br.ufmg.dcc.clients.yarn.framework;
 import br.ufmg.dcc.clients.yarn.framework.exceptions.FrameworkException;
 import br.ufmg.dcc.clients.yarn.framework.log.Loggers;
 
-
 import java.io.*;
 import java.net.InetAddress;
 import java.net.URISyntaxException;
@@ -12,6 +11,8 @@ import java.util.*;
 import java.nio.ByteBuffer;
 import java.util.concurrent.atomic.AtomicInteger;
 
+import br.ufmg.dcc.clients.yarn.framework.rpc.CustomClientFactory;
+import br.ufmg.dcc.clients.yarn.framework.rpc.YarnApplicationMasterInterface;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
 import org.apache.hadoop.fs.FileSystem;
@@ -29,6 +30,8 @@ import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.util.Records;
 import org.apache.logging.log4j.LogManager;
 import org.apache.logging.log4j.Logger;
+import org.apache.xmlrpc.client.XmlRpcClient;
+import org.apache.xmlrpc.client.XmlRpcClientConfigImpl;
 
 
 /**
@@ -55,10 +58,6 @@ public class YarnApplicationClient {
     private static final String YARN_WORKER_KILL_TIMEOUT = "yarn-worker-kill-timeout";
     private static final String DEFAULT_TIMEOUT = "180"; // 3 minutes
 
-//    private static final String MESOS_AUTHENTICATE = "mesos-authenticate";
-//    private static final String MESOS_PRINCIPAL = "mesos-principal";
-//    private static final String MESOS_SECRET = "mesos-secret";
-
     private static final String MAX_CONNECTION_ERRORS = "max-connection-errors";
     private static final String DEFAULT_MAX_CONNECTION_ERRORS = "360";
 
@@ -75,20 +74,29 @@ public class YarnApplicationClient {
     private static final String KEYPAIR_LOCATION_DEFAULT = "/home/" + System.getProperty("user.name") + "/.ssh";
 
     private static final Logger LOGGER = LogManager.getLogger(Loggers.YARN_CLIENT);
+    private static final String UNDEFINED_IP = "-1.-1.-1.-1";
 
     private Configuration conf;
     private YarnClient client;
+    private ApplicationId applicationId;
+
+    private int rpcPort;
+    private String rpcAddress;
+    private String masterHostname;
+    private YarnApplicationMasterInterface yam;
+
+    private final AtomicInteger taskIdGenerator = new AtomicInteger();
+    private HashMap<String, String> containerMaps;
 
     private final String workerName;
     private final String applicationName;
-    private ApplicationId applicationId;
-    private YarnDriver driver;
-    private final AtomicInteger taskIdGenerator = new AtomicInteger();
-
+    private final int runWorkerTimeout;
+    private final int killWorkerTimeout;
     private final String defaultPassword;
+    private final String publicKey;
+    private final String networkDocker;
 
-    private String masterHostname;
-    private HashMap<String, String> containerMaps;
+
     /**
      * Creates a new YarnFramework client with the given properties
      *
@@ -112,8 +120,8 @@ public class YarnApplicationClient {
 
         int applicationTimeout = Integer.parseInt(
                 props.getOrDefault(YARN_FRAMEWORK_APPLICATION_TIMEOUT, YARN_FRAMEWORK_APPLICATION_TIMEOUT_DEFAULT));
-        long runWorkerTimeout = Long.parseLong(props.getOrDefault(YARN_WORKER_WAIT_TIMEOUT, DEFAULT_TIMEOUT));
-        long killWorkerTimeout = Long.parseLong(props.getOrDefault(YARN_WORKER_KILL_TIMEOUT, DEFAULT_TIMEOUT));
+        this.runWorkerTimeout = Integer.parseInt(props.getOrDefault(YARN_WORKER_WAIT_TIMEOUT, DEFAULT_TIMEOUT));
+        this.killWorkerTimeout = Integer.parseInt(props.getOrDefault(YARN_WORKER_KILL_TIMEOUT, DEFAULT_TIMEOUT));
         int maxAttempt = Integer.parseInt(props.getOrDefault(MAX_CONNECTION_ERRORS, DEFAULT_MAX_CONNECTION_ERRORS));
 
         this.applicationName = props.getOrDefault(YARN_FRAMEWORK_NAME, YARN_FRAMEWORK_NAME_DEFAULT);
@@ -125,13 +133,13 @@ public class YarnApplicationClient {
         String queue = props.getOrDefault(YARN_QUEUE, YARN_DEFULT_QUEUE);
         LOGGER.info("Setting yarn queue: " + queue);
 
-        String networkDocker = props.getOrDefault(YARN_DOCKER_NETWORK_NAME, YARN_DOCKER_NETWORK_BRIDGE);
-        LOGGER.info("Using custom network for Docker: " + networkDocker);
+        this.networkDocker = props.getOrDefault(YARN_DOCKER_NETWORK_NAME, YARN_DOCKER_NETWORK_BRIDGE);
+        LOGGER.info("Using custom network for Docker: " + this.networkDocker);
 
         String defaultUser = props.getOrDefault(VM_USER, VM_USER_DEFAULT);
         this.defaultPassword = props.getOrDefault(VM_PASS, "");
 
-        String publicKey = getPublicKey(props);
+        this.publicKey = getPublicKey(props);
 
         try {
             this.masterHostname = InetAddress.getLocalHost().getHostName();
@@ -141,6 +149,14 @@ public class YarnApplicationClient {
 
         client.init(conf);
         client.start();
+
+        startYarnMasterApplication(defaultUser, yarnMasterIp, applicationTimeout, maxAttempt, queue);
+        startRPCClient();
+
+    }
+
+    public void startYarnMasterApplication(String defaultUser, String yarnMasterIp, int applicationTimeout,
+                                           int maxAttempt, String queue) throws FrameworkException {
 
         try {
 
@@ -154,7 +170,7 @@ public class YarnApplicationClient {
             amContainer.setEnvironment(environment);
 
             Vector<CharSequence> vargs = new Vector<>(30);
-            vargs.add(ApplicationConstants.Environment.JAVA_HOME.$$()+"/bin/java");
+            vargs.add(ApplicationConstants.Environment.JAVA_HOME.$$() + "/bin/java");
             vargs.add("br.ufmg.dcc.clients.yarn.framework.YarnApplicationMaster");
             vargs.add(defaultUser);
             vargs.add(this.masterHostname);
@@ -198,28 +214,55 @@ public class YarnApplicationClient {
 
             // Submit application
             applicationId = appContext.getApplicationId();
-            LOGGER.info("Initializing Yarn Client by applicationId "+applicationId);
+            LOGGER.info("Initializing Yarn Client by applicationId " + applicationId);
 
             client.submitApplication(appContext);
 
+        } catch (Exception exception) {
+            throw new FrameworkException("Error while trying to start a Yarn Application Master");
+        }
+
+        try {
+
             ApplicationReport appReport = client.getApplicationReport(applicationId);
             YarnApplicationState appState = appReport.getYarnApplicationState();
-            while (appState != YarnApplicationState.RUNNING){
-                Thread.sleep(1000);
+
+            while (appState != YarnApplicationState.RUNNING) {
                 appReport = client.getApplicationReport(applicationId);
                 appState = appReport.getYarnApplicationState();
             }
-            int serverPort = appReport.getRpcPort();
-            String applicationMasterHost = appReport.getHost();
 
-            driver = new YarnDriver(applicationMasterHost, serverPort);
-            driver.setRunWorkerTimeout(runWorkerTimeout);
-            driver.setKillWorkerTimeout(killWorkerTimeout);
-            driver.setPublicKey(publicKey);
-            driver.setNetworkDocker(networkDocker);
+            this.rpcPort = appReport.getRpcPort();
+            this.rpcAddress = appReport.getHost();
 
-        } catch (YarnException | IOException | InterruptedException e) {
-            e.printStackTrace();
+        } catch (YarnException | IOException e) {
+            throw new FrameworkException("Error while trying to retrieve the Yarn Application Master status");
+        }
+
+
+    }
+
+    public void startRPCClient() throws FrameworkException {
+        try {
+            Thread.sleep(1000);
+
+            String url = "http://" + this.rpcAddress + ":" + this.rpcPort;
+            LOGGER.debug("Connecting with Yarn Client via RPC ("+url+")");
+
+            XmlRpcClientConfigImpl config = new XmlRpcClientConfigImpl();
+            config.setServerURL(new java.net.URL(url));
+            config.setConnectionTimeout(100 * 1000);
+            config.setReplyTimeout(600 * 1000);
+
+            XmlRpcClient rpcClient = new XmlRpcClient();
+            rpcClient.setConfig(config);
+
+            CustomClientFactory factory = new CustomClientFactory(rpcClient);
+
+            yam = (YarnApplicationMasterInterface) factory.newInstance(YarnApplicationMasterInterface.class);
+
+        } catch (Exception exception) {
+            throw new FrameworkException("Error while trying to start an RPC service with Yarn Application Master");
         }
     }
 
@@ -270,26 +313,24 @@ public class YarnApplicationClient {
         return ByteBuffer.wrap(dob.getData(), 0, dob.getLength());
     }
 
-    public Map<String, LocalResource> initResource() {
+    public Map<String, LocalResource> initResource() throws FrameworkException {
         Map<String, LocalResource> localResources = new HashMap<>();
 
+        String jarPath = "file://";
         try {
+            jarPath +=
+                    new File(YarnApplicationClient.class.getProtectionDomain().getCodeSource().getLocation()
+                            .toURI()).getPath();
 
+        } catch (URISyntaxException e) {
+            jarPath += "/opt/COMPSs/Runtime/cloud-conn/yarn-conn.jar";
+        }
+
+        try {
             LocalResource amJarRsrc = Records.newRecord(LocalResource.class);
 
-            FileSystem fs =  FileSystem.get(conf);
-            String jarPath = "file://";
-            try {
-                 jarPath +=
-                        new File(YarnApplicationClient.class.getProtectionDomain().getCodeSource().getLocation()
-                                .toURI()).getPath();
-
-            } catch (URISyntaxException e) {
-                jarPath += "/opt/COMPSs/Runtime/cloud-conn/yarn-conn.jar";
-            }
-
             Path dst = new Path(jarPath);
-            FileStatus destStatus = fs.getFileStatus(dst);
+            FileStatus destStatus = FileSystem.get(conf).getFileStatus(dst);
             amJarRsrc.setType(LocalResourceType.FILE);
             amJarRsrc.setVisibility(LocalResourceVisibility.PUBLIC);
             amJarRsrc.setResource(URL.fromPath(dst));
@@ -298,7 +339,7 @@ public class YarnApplicationClient {
             localResources.put("yarn-conn.jar", amJarRsrc);
 
         } catch (IllegalArgumentException | IOException e) {
-            e.printStackTrace();
+            throw new FrameworkException("Yarn connector jar could not be sent to Yarn container");
         }
         return localResources;
     }
@@ -307,6 +348,7 @@ public class YarnApplicationClient {
         StringBuilder classPathEnv = new StringBuilder(
                 ApplicationConstants.Environment.CLASSPATH.$$()).append(
                 ApplicationConstants.CLASS_PATH_SEPARATOR).append("./*");
+
         for (String c : conf
                 .getStrings(
                         YarnConfiguration.YARN_APPLICATION_CLASSPATH,
@@ -338,13 +380,15 @@ public class YarnApplicationClient {
      *
      * @return Identifier assigned to new worker
      */
-    public String requestWorker(String imageName, int cpus, int memory) {
+    public synchronized String requestWorker(String imageName, int cpus, int memory) {
 
         LOGGER.info("Requested a worker");
         String workerId = generateWorkerId(applicationName, workerName, this.getId());
-        String containerId = driver.requestWorker(workerId, imageName, cpus, memory);
-        containerMaps.put(workerId, containerId);
+        String containerId = yam.requestWorker(runWorkerTimeout, workerId, imageName, cpus, memory,
+                this.publicKey, this.networkDocker);
 
+        containerMaps.put(workerId, containerId);
+        LOGGER.info("Docker worker "+ workerId + " created in Yarn container " + containerId);
         return workerId;
     }
 
@@ -358,16 +402,19 @@ public class YarnApplicationClient {
     }
 
 
-
     /**
      * Wait for worker with identifier id.
      *
      * @param id Worker identifier.
      * @return Worker IP address.
      */
-    public String waitWorkerUntilRunning(String id)  {
+    public synchronized String waitWorkerUntilRunning(String id)  {
         LOGGER.info("Waiting worker with id " + id);
-        return driver.waitTask(id);
+        try {
+            return yam.waitTask(runWorkerTimeout, id);
+        } catch (FrameworkException e) {
+            return UNDEFINED_IP;
+        }
     }
 
     /**
@@ -375,20 +422,24 @@ public class YarnApplicationClient {
      *
      * @param id Worker identifier
      */
-    public void removeWorker(String id) {
+    public synchronized  void removeWorker(String id)  {
         LOGGER.debug("Remove worker with id " + id);
-        boolean success = driver.removeTask(id);
+        boolean success = false;
+        try {
+            success = yam.removeTask(killWorkerTimeout, id);
+        } catch (FrameworkException ignored) {
+        }
         LOGGER.debug("Remove worker with id " + id + ": " + success);
     }
 
     /**
      * Stop the Yarn Framework.
      */
-    public void stop() {
+    public void stop() throws FrameworkException {
         LOGGER.debug("Stopping Yarn Framework");
 
         try {
-            driver.stopFramework();
+            yam.stopFramework(killWorkerTimeout);
 
             ApplicationReport appReport = client.getApplicationReport(applicationId);
             YarnApplicationState appState = appReport.getYarnApplicationState();
@@ -404,7 +455,7 @@ public class YarnApplicationClient {
             client.stop();
 
         }catch (InterruptedException | IOException | YarnException e) {
-            //e.printStackTrace();
+            throw new FrameworkException("The Yarn Framework could not be gracefully closed");
         }
 
     }

@@ -12,6 +12,8 @@ import java.util.regex.Matcher;
 import java.util.regex.Pattern;
 import java.util.stream.Collectors;
 
+import br.ufmg.dcc.clients.yarn.framework.rpc.YAMRequestProcessorFactoryFactory;
+import br.ufmg.dcc.clients.yarn.framework.rpc.YarnApplicationMasterInterface;
 import org.apache.commons.io.IOUtils;
 import org.apache.hadoop.conf.Configuration;
 import org.apache.hadoop.fs.FileStatus;
@@ -30,27 +32,25 @@ import org.apache.hadoop.yarn.conf.YarnConfiguration;
 import org.apache.hadoop.yarn.exceptions.YarnException;
 import org.apache.hadoop.yarn.security.AMRMTokenIdentifier;
 import org.apache.hadoop.yarn.util.Records;
+import org.apache.xmlrpc.XmlRpcException;
 import org.apache.xmlrpc.server.PropertyHandlerMapping;
 import org.apache.xmlrpc.server.XmlRpcServer;
 import org.apache.xmlrpc.server.XmlRpcServerConfigImpl;
-import org.apache.xmlrpc.webserver.ServletWebServer;
 import org.apache.xmlrpc.webserver.WebServer;
-import org.apache.xmlrpc.webserver.XmlRpcServlet;
 
 
 /**
  * Yarn Scheduler implementation for COMPSs.
  */
-public class YarnApplicationMaster {
+public class YarnApplicationMaster implements YarnApplicationMasterInterface {
 
     private static final String UNDEFINED_IP = "-1.-1.-1.-1";
 
-    //private static final Logger LOGGER = LogManager.getLogger(Loggers.YARN_APPLICATION_MASTER);
     private static final String ERROR_TASK_ID = "ERROR: Task does not exist. TaskId = ";
 
-    private List<String> runningTasks;
-    private List<String> pendingTasks;
-    private Map<String, YarnTask> tasks;
+    private List<String> runningTasks = Collections.synchronizedList(new LinkedList<String>());
+    private List<String> pendingTasks = Collections.synchronizedList(new LinkedList<String>());
+    private Map<String, YarnTask> tasks = Collections.synchronizedMap(new HashMap<String, YarnTask>());
 
     private AMRMClient<AMRMClient.ContainerRequest> rmClient;
     private NMClient nmClient;
@@ -58,85 +58,54 @@ public class YarnApplicationMaster {
 
     private ByteBuffer allTokens;
     private int progress;
-    private String defaultUser;
-    private String masterIp;
-    private String masterHostname;
+    private final String defaultUser;
+    private final String masterIp;
+    private final String masterHostname;
     private String RPCServerFile;
-    private int serverPort;
-    private String serverAddress;
-    private WebServer webServer;
+    private final int serverPort;
+    private final String serverAddress;
 
+    public static void main(String[] args) throws XmlRpcException, IOException, YarnException {
 
-    public static void main(String[] args){
+        String serverAddress = getServerAddress();
+        int serverPort = getServerPort(serverAddress);
 
-        String serverAddress;
-        try {
-            serverAddress = InetAddress.getLocalHost().getHostName();
-        } catch (UnknownHostException e) {
-            serverAddress = "localhost";
-        }
+        WebServer webServer = new WebServer(serverPort);
 
-        int serverPort = 9942;
-        while (PortIsInUse(serverAddress, serverPort))
-            serverPort += 1;
+        XmlRpcServer server = webServer.getXmlRpcServer();
+        PropertyHandlerMapping phm = new PropertyHandlerMapping();
 
+        YarnApplicationMaster yam = new YarnApplicationMaster(args[0], args[1], args[2], serverAddress, serverPort);
+        phm.setRequestProcessorFactoryFactory(new YAMRequestProcessorFactoryFactory(yam));
+        phm.addHandler(YarnApplicationMasterInterface.class.getName(), YarnApplicationMaster.class);
+        server.setHandlerMapping(phm);
 
-        YarnApplicationMaster yam = new YarnApplicationMaster(args[0], args[1], args[2]);
-        yam.startServer(serverAddress, serverPort);
-    }
+        XmlRpcServerConfigImpl serverConfig = (XmlRpcServerConfigImpl) server.getConfig();
+        serverConfig.setEnabledForExtensions(true);
+        serverConfig.setContentLengthOptional(false);
 
-    public static void log(String msg){
-        System.out.println(msg);
-    }
+        webServer.start();
 
-    public void startServer(String serverAddress, int serverPort){
-        this.serverAddress = serverAddress;
-        this.serverPort = serverPort;
-
-
-        try {
-
-            webServer = new WebServer(serverPort);
-
-            XmlRpcServer server = webServer.getXmlRpcServer();
-            PropertyHandlerMapping propHandlerMapping = new PropertyHandlerMapping();
-            propHandlerMapping.addHandler("default", YarnApplicationMaster.class);
-            server.setHandlerMapping(propHandlerMapping);
-
-            XmlRpcServerConfigImpl serverConfig = (XmlRpcServerConfigImpl) server.getConfig();
-
-            serverConfig.setEnabledForExtensions(false);
-            serverConfig.setContentLengthOptional(false);
-            serverConfig.setKeepAliveEnabled(true);
-
-            webServer.start();
-
-            init();
-            waitRegistration();
-
-            log("XML-RPC Server started on port "+serverPort);
-
-        } catch (Exception exception){
-            log("JavaServer: " + exception);
-
-        }
+        logger("XML-RPC Server started on port "+serverPort);
     }
 
 
     /**
      * Creates a new Yarn Framework scheduler.
      */
-    public YarnApplicationMaster(String defaultUser, String masterHostname, String masterIp) {
-        log("Initialize " + this.getClass().getName());
+    public YarnApplicationMaster(String defaultUser, String masterHostname, String masterIp,
+                                 String serverAddress, int serverPort) throws IOException, YarnException {
+        logger("Initialize " + this.getClass().getName());
         progress = 0;
 
         this.defaultUser = defaultUser;
         this.masterHostname = masterHostname;
         this.masterIp = masterIp;
+        this.serverAddress = serverAddress;
+        this.serverPort = serverPort;
 
-        runningTasks = Collections.synchronizedList(new LinkedList<String>());
-        pendingTasks = Collections.synchronizedList(new LinkedList<String>());
-        tasks = Collections.synchronizedMap(new HashMap<String, YarnTask>());
+        init();
+        waitRegistration();
 
     }
 
@@ -191,20 +160,22 @@ public class YarnApplicationMaster {
 
     }
 
-    public void stopFramework() {
+    public boolean stopFramework(int timeout) {
         try {
-            File f= new File(RPCServerFile);
+            File f = new File(RPCServerFile);
             f.delete();
 
+            logger("Stopping Yarn Application Master");
             rmClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,
                     "COMPSs Execution Completed",
                     "");
+
         }catch (YarnException | IOException ignored) {
             System.exit(1);
         }
 
         System.exit(0);
-
+        return true;
     }
 
 
@@ -217,9 +188,9 @@ public class YarnApplicationMaster {
      * @param imageName Docker image name.
      * @return Yarn container Identifier generated for that worker.
      */
-    public synchronized String requestWorker(String workerId, String imageName, int VCores, int Memory,
-                                             String publicKey, String dockerNetwork) throws IOException {
-        log("Requested worker");
+    public String requestWorker(int timeout, String workerId, String imageName, int VCores, int Memory,
+                                String publicKey, String dockerNetwork) {
+        logger("Receiving request to new worker");
         String containerId = "";
         pendingTasks.add(workerId);
 
@@ -255,15 +226,20 @@ public class YarnApplicationMaster {
                 Map<String, LocalResource> localResources = new HashMap<>();
                 LocalResource rpc_server = Records.newRecord(LocalResource.class);
                 conf.set("fs.defaultFS", "file:///");
-                FileSystem fs =  FileSystem.get(conf);
-                Path dst = new Path("file://"+RPCServerFile);
-                FileStatus destStatus = fs.getFileStatus(dst);
-                rpc_server.setType(LocalResourceType.FILE);
-                rpc_server.setVisibility(LocalResourceVisibility.PUBLIC);
-                rpc_server.setResource(URL.fromPath(dst));
-                rpc_server.setTimestamp(destStatus.getModificationTime());
-                rpc_server.setSize(-1);
-                localResources.put("rpc_server.py", rpc_server);
+
+                try {
+                    FileSystem fs = FileSystem.get(conf);
+                    Path dst = new Path("file://"+RPCServerFile);
+                    FileStatus destStatus = fs.getFileStatus(dst);
+                    rpc_server.setType(LocalResourceType.FILE);
+                    rpc_server.setVisibility(LocalResourceVisibility.PUBLIC);
+                    rpc_server.setResource(URL.fromPath(dst));
+                    rpc_server.setTimestamp(destStatus.getModificationTime());
+                    rpc_server.setSize(-1);
+                    localResources.put("rpc_server.py", rpc_server);
+                } catch (IOException e) {
+                    e.printStackTrace();
+                }
 
                 Vector<CharSequence> vargs = new Vector<CharSequence>(30);
                 vargs.add("docker run -t");
@@ -283,7 +259,6 @@ public class YarnApplicationMaster {
                 for (CharSequence str : vargs) {
                     command.append(str).append(" ");
                 }
-                log(command.toString());
 
                 // Launch container by create ContainerLaunchContext
                 ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
@@ -291,7 +266,7 @@ public class YarnApplicationMaster {
                 ctx.setTokens(allTokens.duplicate());
                 ctx.setCommands(Collections.singletonList(command.toString()));
 
-                log("Launching container " + containerId);
+                logger("Launching container " + containerId);
 
                 try {
                     nmClient.startContainer(container, ctx);
@@ -338,13 +313,10 @@ public class YarnApplicationMaster {
      * @param timeout Timeout in seconds.
      * @throws FrameworkException if waits for timeout units.
      */
-    public synchronized String waitTask(String id, int timeout) throws FrameworkException, IOException, YarnException {
+    public String waitTask(int timeout, String id) throws FrameworkException {
 
         String ip = UNDEFINED_IP;
-        log("Waiting task "+ id);
-
-        //TODO: add timeout
-        //TimeUnit unit = TimeUnit.valueOf(unit);
+        logger("Waiting task "+ id);
 
         String result = "";
 
@@ -354,7 +326,7 @@ public class YarnApplicationMaster {
 
         YarnTask task = tasks.get(id);
 
-        waitDockerContainerIsReady(task, timeout);
+        waitDockerContainerIsReady(task);
 
         String nmPort = System.getenv("NM_HTTP_PORT");
         String nmHost = System.getenv("NM_HOST");
@@ -364,7 +336,12 @@ public class YarnApplicationMaster {
 
         while (!result.contains("ip:")) {
             Runtime rt = Runtime.getRuntime();
-            Process pr = rt.exec("curl -s -S " + url);
+            Process pr = null;
+            try {
+                pr = rt.exec("curl -s -S " + url);
+            } catch (IOException e) {
+                e.printStackTrace();
+            }
 
             result = new BufferedReader(
                     new InputStreamReader(pr.getInputStream()))
@@ -383,7 +360,7 @@ public class YarnApplicationMaster {
                     .replace("\n", "");
 
             task.setIp(ip);
-            log("Container is ready with ip " + ip);
+            logger("Container is ready with ip " + ip);
 
             tasks.put(id, task);
             pendingTasks.remove(id);
@@ -393,24 +370,30 @@ public class YarnApplicationMaster {
         return ip;
     }
 
-    public void waitDockerContainerIsReady(YarnTask task, int timeout) throws IOException, YarnException {
-        log("Checking if Yarn container is running");
+    public void waitDockerContainerIsReady(YarnTask task) throws FrameworkException {
+        logger("Checking if Yarn container is running");
 
         String nodeId = task.getNodeId();
         ContainerId container = ContainerId.fromString(task.getContainerId());
         NodeId node = NodeId.fromString(nodeId);
 
-        ContainerStatus cs = nmClient.getContainerStatus(container, node);
-        boolean isReady = cs.getState().equals(ContainerState.RUNNING);
-
-        int retry = 0;
-        while (!isReady){
-            retry++;
-            if (retry % 100 == 0)
-                log("Waiting Docker Container (" + task.getId() + ") - retry: " + retry);
+        ContainerStatus cs = null;
+        try {
             cs = nmClient.getContainerStatus(container, node);
-            isReady = cs.getState().equals(ContainerState.RUNNING);
 
+            boolean isReady = cs.getState().equals(ContainerState.RUNNING);
+
+            int retry = 0;
+            while (!isReady){
+                retry++;
+                if (retry % 100 == 0)
+                    logger("Waiting Docker Container (" + task.getId() + ") - retry: " + retry);
+                cs = nmClient.getContainerStatus(container, node);
+                isReady = cs.getState().equals(ContainerState.RUNNING);
+            }
+        } catch (YarnException | IOException e) {
+            throw new FrameworkException("Yarn Connector failed to check status of Yarn container " +
+                    container.toString());
         }
 
     }
@@ -419,9 +402,9 @@ public class YarnApplicationMaster {
      * Wait for the framework to register in Yarn. If it is already registered returns immediately.
      */
     public void waitRegistration() throws IOException, YarnException {
-        log("Wait for framework to register");
+        logger("Wait for framework to register");
         rmClient.registerApplicationMaster(serverAddress, serverPort, "");
-        log("Framework is registered");
+        logger("Framework is registered (" +serverAddress+":"+serverPort+")");
 
     }
 
@@ -434,18 +417,17 @@ public class YarnApplicationMaster {
      * @param timeout Timeout in seconds.
      * @throws FrameworkException if task does not exist.
      */
-    public boolean removeTask(String id, int timeout) throws FrameworkException, IOException, YarnException {
+    public boolean removeTask(int timeout, String id) throws FrameworkException {
 
-        synchronized (this) {
-            // Task still in pending queue, not launched to run in Yarn
-            if (pendingTasks.contains(id)) {
-                log("Task still in pending queue, not launched to run in Yarn");
-                pendingTasks.remove(id);
-                return false; //checar pending
-            } else if (!tasks.containsKey(id)) {
-                runningTasks.remove(id);
-                throw new FrameworkException(ERROR_TASK_ID + id);
-            }
+        // Task still in pending queue, not launched to run in Yarn
+        if (pendingTasks.contains(id)) {
+            logger("Task still in pending queue, not launched to run in Yarn");
+            pendingTasks.remove(id);
+            return false;
+
+        } else if (!tasks.containsKey(id)) {
+            runningTasks.remove(id);
+            throw new FrameworkException(ERROR_TASK_ID + id);
         }
 
         YarnTask task  = tasks.get(id);
@@ -454,23 +436,56 @@ public class YarnApplicationMaster {
 
         // stopping Docker Container
         Runtime rt = Runtime.getRuntime();
-        Process pr = rt.exec("docker rm -f " + id);
+        Process pr = null;
+        try {
+            pr = rt.exec("docker rm -f " + id);
+
+        } catch (IOException e) {
+            throw new FrameworkException("Yarn Connector failed to remove docker container named " + id);
+        }
 
         String result = new BufferedReader(
                 new InputStreamReader(pr.getInputStream()))
                 .lines()
                 .collect(Collectors.joining("\n"));
 
+
         if (result.equals(id)){
-            log("Docker Container (" + id + ") is removed.");
+            logger("Docker Container (" + id + ") is removed.");
+
             // stopping Yarn Container
-            nmClient.stopContainer(ContainerId.fromString(containerId), NodeId.fromString(nodeId));
-            //waitTask(id, TaskState.TASK_KILLED, timeout, unit);
+            try {
+                nmClient.stopContainer(ContainerId.fromString(containerId), NodeId.fromString(nodeId));
+            } catch (YarnException | IOException e) {
+                throw new FrameworkException("Yarn Connector failed to stop Yarn container with id " + containerId);
+            }
+
             tasks.remove(id);
             return true;
         }
 
         return false;
+    }
+
+    public static String getServerAddress(){
+        String serverAddress;
+        try {
+            serverAddress = InetAddress.getLocalHost().getHostName();
+        } catch (UnknownHostException e) {
+            serverAddress = "localhost";
+        }
+        return serverAddress;
+    }
+
+    public static int getServerPort(String serverAddress){
+        int serverPort = 9942;
+        while (PortIsInUse(serverAddress, serverPort))
+            serverPort += 1;
+        return serverPort;
+    }
+
+    public static void logger(String msg){
+        System.out.println(msg);
     }
 
 }

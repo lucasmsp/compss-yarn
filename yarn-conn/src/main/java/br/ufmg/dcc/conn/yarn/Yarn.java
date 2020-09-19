@@ -53,10 +53,11 @@ public class Yarn extends Connector {
         logger.info("Initializing Yarn Connector");
         resources = new HashMap<>();
         try {
-            framework = new YarnApplicationClient(props);
-        } catch (FrameworkException fe) {
-            throw new ConnException(fe);
+            this.framework = new YarnApplicationClient(props);
+        } catch (FrameworkException e) {
+            throw new ConnException(e);
         }
+
     }
 
     /**
@@ -73,9 +74,9 @@ public class Yarn extends Connector {
         logger.debug("Creating a yarn container");
 
         // memory must be a int because rpc xml do not support a long type.
-        float memory_giga = (hd.getMemorySize() == -1.0F) ?  hd.getMemorySize() : 0.25F;
-        int memory_mb = Math.round(memory_giga * GIGAS_TO_MEGAS);
-        String newId = framework.requestWorker(hd.getImageName(), hd.getTotalCPUComputingUnits(), memory_mb);
+        float memoryGb = (hd.getMemorySize() == -1.0F) ?  hd.getMemorySize() : 0.25F;
+        int memoryMb = Math.round(memoryGb * GIGAS_TO_MEGAS);
+        String newId = framework.requestWorker(hd.getImageName(), hd.getTotalCPUComputingUnits(), memoryMb);
         resources.put(newId, new VirtualResource(newId, hd, sd, prop));
         logger.debug("Yarn container created");
         return newId;
@@ -144,7 +145,13 @@ public class Yarn extends Connector {
      */
     @Override
     public void close() {
-        framework.stop();
+
+        try {
+            framework.stop();
+        } catch (FrameworkException e) {
+            e.printStackTrace();
+        }
+
     }
 
 }
