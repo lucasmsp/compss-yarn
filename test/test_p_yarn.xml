@@ -1,0 +1,94 @@
+<?xml version="1.0" encoding="UTF-8" standalone="yes"?>
+<Project>
+	<MasterNode />
+	<Cloud>
+		<InitialVMs>1</InitialVMs>
+		<MinimumVMs>2</MinimumVMs>
+		<MaximumVMs>2</MaximumVMs>
+
+		<CloudProvider Name="YarnCluster">
+			<LimitOfVMs>8</LimitOfVMs>
+			<Properties>
+
+				<Property>
+					<Name>yarn-framework-register-timeout</Name>
+					    <Value>180000</Value>
+				</Property>
+
+				<Property>
+					<Name>yarn-authenticate</Name>
+					<Value>false</Value>
+				</Property>
+
+                <Property>
+					<Name>yarn-docker-network-name</Name>
+					<Value>bridge</Value>
+				</Property>
+
+				<!--Property>
+					<Name>mesos-default-principal</Name>
+					<Value>ubuntu</Value>
+				</Property>
+				<Property>
+					<Name>mesos-default-secret</Name>
+					<Value>ubuntusecret</Value>
+				</Property-->
+
+				<!-- Optional connector parameters -->
+				<Property>
+					<Name>max-vm-creation-time</Name>
+					<Value>10</Value> <!-- Minutes -->
+				</Property>
+
+				<Property>
+					<Name>max-connection-errors</Name>
+					<Value>360</Value>
+				</Property>
+
+				<!-- Abstract SSH Connector parameters -->
+
+                <Property>
+					<Name>time-slot</Name>
+					<Value>10</Value>
+				</Property>
+
+
+				<Property>
+					<Name>vm-user</Name>
+					<Value>root</Value>
+				</Property>
+
+				<Property>
+					<Name>vm-keypair-name</Name>
+					<Value>id_rsa</Value>
+				</Property>
+
+				<Property>
+					<Name>vm-keypair-location</Name>
+					<Value>~/.ssh</Value>
+				</Property>
+
+			</Properties>
+			<Images>
+
+                 <Image Name="lucasmsp/compss2.6:latest">
+					<InstallDir>/opt/COMPSs/</InstallDir>
+					<WorkingDir>/tmp/</WorkingDir>
+					<User>root</User>
+
+					<Application>
+						<AppDir>/tmp/</AppDir>
+					</Application>
+
+					<Package>
+						<Source>/tmp/test.tar.gz</Source>
+						<Target>/tmp/</Target>
+					</Package>
+				</Image>
+			</Images>
+			<InstanceTypes>
+				<InstanceType Name="small" />
+			</InstanceTypes>
+		</CloudProvider>
+	</Cloud>
+</Project>
