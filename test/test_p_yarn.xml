@@ -10,29 +10,15 @@
 			<LimitOfVMs>8</LimitOfVMs>
 			<Properties>
 
-				<Property>
-					<Name>yarn-framework-register-timeout</Name>
-					    <Value>180000</Value>
-				</Property>
-
-				<Property>
-					<Name>yarn-authenticate</Name>
-					<Value>false</Value>
-				</Property>
-
                 <Property>
 					<Name>yarn-docker-network-name</Name>
 					<Value>bridge</Value>
 				</Property>
 
-				<!--Property>
-					<Name>mesos-default-principal</Name>
-					<Value>ubuntu</Value>
+                <Property>
+					<Name>yarn-hdfs-connector</Name>
+					<Value>hdfs://localhost:9000/yarn-conn.jar</Value>
 				</Property>
-				<Property>
-					<Name>mesos-default-secret</Name>
-					<Value>ubuntusecret</Value>
-				</Property-->
 
 				<!-- Optional connector parameters -->
 				<Property>
@@ -52,12 +38,6 @@
 					<Value>10</Value>
 				</Property>
 
-
-				<Property>
-					<Name>vm-user</Name>
-					<Value>root</Value>
-				</Property>
-
 				<Property>
 					<Name>vm-keypair-name</Name>
 					<Value>id_rsa</Value>
@@ -68,10 +48,15 @@
 					<Value>~/.ssh</Value>
 				</Property>
 
+                <Property>
+                    <Name>vm-user</Name>
+                    <Value>root</Value>
+                </Property>
+
 			</Properties>
 			<Images>
 
-                 <Image Name="lucasmsp/compss2.6:latest">
+                 <Image Name="lucasmsp/compss:2.6">
 					<InstallDir>/opt/COMPSs/</InstallDir>
 					<WorkingDir>/tmp/</WorkingDir>
 					<User>root</User>

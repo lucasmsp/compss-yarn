@@ -71,8 +71,6 @@ public class Yarn extends Connector {
     @Override
     public Object create(String requestName, HardwareDescription hd, SoftwareDescription sd, Map<String,
             String> prop, StarterCommand starterCMD) {
-        logger.debug("Creating a yarn container");
-
         // memory must be a int because rpc xml do not support a long type.
         float memoryGb = (hd.getMemorySize() == -1.0F) ?  hd.getMemorySize() : 0.25F;
         int memoryMb = Math.round(memoryGb * GIGAS_TO_MEGAS);
@@ -137,7 +135,11 @@ public class Yarn extends Connector {
     public void destroy(Object id) {
         String identifier = (String) id;
         resources.remove(identifier);
-        framework.removeWorker(identifier);
+        try {
+            framework.removeWorker(identifier);
+        } catch (FrameworkException e) {
+            e.printStackTrace();
+        }
     }
 
     /**

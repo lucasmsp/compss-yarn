@@ -14,11 +14,8 @@ import java.util.stream.Collectors;
 
 import br.ufmg.dcc.clients.yarn.framework.rpc.YAMRequestProcessorFactoryFactory;
 import br.ufmg.dcc.clients.yarn.framework.rpc.YarnApplicationMasterInterface;
-import org.apache.commons.io.IOUtils;
+
 import org.apache.hadoop.conf.Configuration;
-import org.apache.hadoop.fs.FileStatus;
-import org.apache.hadoop.fs.FileSystem;
-import org.apache.hadoop.fs.Path;
 import org.apache.hadoop.io.DataOutputBuffer;
 import org.apache.hadoop.security.Credentials;
 import org.apache.hadoop.security.UserGroupInformation;
@@ -58,10 +55,8 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
 
     private ByteBuffer allTokens;
     private int progress;
-    private final String defaultUser;
     private final String masterIp;
     private final String masterHostname;
-    private String RPCServerFile;
     private final int serverPort;
     private final String serverAddress;
 
@@ -75,7 +70,7 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         XmlRpcServer server = webServer.getXmlRpcServer();
         PropertyHandlerMapping phm = new PropertyHandlerMapping();
 
-        YarnApplicationMaster yam = new YarnApplicationMaster(args[0], args[1], args[2], serverAddress, serverPort);
+        YarnApplicationMaster yam = new YarnApplicationMaster(args[0], args[1], serverAddress, serverPort);
         phm.setRequestProcessorFactoryFactory(new YAMRequestProcessorFactoryFactory(yam));
         phm.addHandler(YarnApplicationMasterInterface.class.getName(), YarnApplicationMaster.class);
         server.setHandlerMapping(phm);
@@ -93,12 +88,11 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
     /**
      * Creates a new Yarn Framework scheduler.
      */
-    public YarnApplicationMaster(String defaultUser, String masterHostname, String masterIp,
+    public YarnApplicationMaster(String masterHostname, String masterIp,
                                  String serverAddress, int serverPort) throws IOException, YarnException {
-        logger("Initialize " + this.getClass().getName());
+        logger("Initializing " + this.getClass().getName());
         progress = 0;
 
-        this.defaultUser = defaultUser;
         this.masterHostname = masterHostname;
         this.masterIp = masterIp;
         this.serverAddress = serverAddress;
@@ -156,15 +150,11 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         nmClient = NMClient.createNMClient();
         nmClient.init(conf);
         nmClient.start();
-        RPCServerFile = getRPCServerFile();
 
     }
 
     public boolean stopFramework(int timeout) {
         try {
-            File f = new File(RPCServerFile);
-            f.delete();
-
             logger("Stopping Yarn Application Master");
             rmClient.unregisterApplicationMaster(FinalApplicationStatus.SUCCEEDED,
                     "COMPSs Execution Completed",
@@ -184,17 +174,26 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
      * in list to be created.
      *
 
+     * @param timeout used internally in rpc connection with client
      * @param workerId Docker Container Id.
-     * @param imageName Docker image name.
+     * @param imageName Docker image name
+     * @param VCores number of cores inside each new container
+     * @param Memory number in mega bytes inside each new container
+     * @param publicKey public key of master user that is running a compss application
+     * @param dockerNetwork docker network
+     * @param userVM docker image user
      * @return Yarn container Identifier generated for that worker.
      */
-    public String requestWorker(int timeout, String workerId, String imageName, int VCores, int Memory,
-                                String publicKey, String dockerNetwork) {
-        logger("Receiving request to new worker");
-        String containerId = "";
-        pendingTasks.add(workerId);
 
-        int startedContainer = 0;
+    public synchronized String requestWorker(int timeout, String workerId, String imageName, int VCores, int Memory,
+                                String publicKey, String dockerNetwork, String userVM){
+        logger("Receiving request to create a new worker");
+        String containerId = "";
+        String keyPath = "~/.ssh/authorized_keys";
+        if (userVM.equals("root"))
+            keyPath = "/root/.ssh/authorized_keys";
+
+        pendingTasks.add(workerId);
 
         Priority priority = Records.newRecord(Priority.class);
         priority.setPriority(0);
@@ -207,11 +206,14 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         // Make container requests to ResourceManager
         AMRMClient.ContainerRequest containerAsk = new AMRMClient.ContainerRequest(requirements,
                 null, null, priority);
+        long requestID = containerAsk.getAllocationRequestId();
 
         rmClient.addContainerRequest(containerAsk);
 
         AllocateResponse response = null;
-        while (startedContainer == 0) {
+        boolean containerRequested = false;
+
+        while (!containerRequested) {
             try {
                 response = rmClient.allocate(progress++);
             } catch (YarnException | IOException e) {
@@ -221,96 +223,68 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
             List<Container> containers = response.getAllocatedContainers();
 
             for (Container container : containers) {
-                containerId = container.getId().toString();
+                if (requestID == container.getAllocationRequestId()) {
+                    rmClient.removeContainerRequest(containerAsk);
 
-                Map<String, LocalResource> localResources = new HashMap<>();
-                LocalResource rpc_server = Records.newRecord(LocalResource.class);
-                conf.set("fs.defaultFS", "file:///");
+                    containerId = container.getId().toString();
 
-                try {
-                    FileSystem fs = FileSystem.get(conf);
-                    Path dst = new Path("file://"+RPCServerFile);
-                    FileStatus destStatus = fs.getFileStatus(dst);
-                    rpc_server.setType(LocalResourceType.FILE);
-                    rpc_server.setVisibility(LocalResourceVisibility.PUBLIC);
-                    rpc_server.setResource(URL.fromPath(dst));
-                    rpc_server.setTimestamp(destStatus.getModificationTime());
-                    rpc_server.setSize(-1);
-                    localResources.put("rpc_server.py", rpc_server);
-                } catch (IOException e) {
-                    e.printStackTrace();
+                    Vector<CharSequence> vargs = new Vector<CharSequence>(10);
+                    vargs.add("docker run -t --rm");
+                    vargs.add("--cpus=" + VCores);
+                    vargs.add("--memory=" + Memory + "m");
+                    vargs.add("--network=" + dockerNetwork);
+                    vargs.add("--entrypoint='bash'");
+                    vargs.add("--name=" + workerId);
+                    vargs.add(imageName);
+                    vargs.add("-c ' echo " + publicKey + " >> " + keyPath + "; " +
+                            "echo " + masterIp + " " + masterHostname + " > /etc/hosts; " +
+                            "service ssh restart; " +
+                            "echo worker is starting;" +
+                            "hostname;" +
+                            "hostname -I;" +
+                            "echo worker is ready;" +
+                            "sleep infinity; " +
+                            "echo Timeout finished;'");
+                    vargs.add("1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout");
+                    vargs.add("2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
+
+                    StringBuilder command = new StringBuilder();
+                    for (CharSequence str : vargs) {
+                        command.append(str).append(" ");
+                    }
+
+                    // Launch container by create ContainerLaunchContext
+                    ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
+                    ctx.setTokens(allTokens.duplicate());
+                    ctx.setCommands(Collections.singletonList(command.toString()));
+
+                    logger("Launching container " + containerId);
+
+                    try {
+                        nmClient.startContainer(container, ctx);
+                    } catch (YarnException | IOException e) {
+                        e.printStackTrace();
+                    }
+
+                    YarnTask yt = new YarnTask(workerId, ctx,
+                            containerId,
+                            container.getNodeId().toString(), userVM);
+
+                    containerRequested = true;
+                    tasks.put(workerId, yt);
                 }
-
-                Vector<CharSequence> vargs = new Vector<CharSequence>(30);
-                vargs.add("docker run -t");
-                vargs.add("--cpus=" + VCores);
-                vargs.add("--memory=" + Memory + "m");
-                vargs.add("--network=" + dockerNetwork);
-                vargs.add("--entrypoint='python3'");
-                vargs.add("--name=" + workerId);
-                vargs.add("--volume=$PWD/rpc_server.py:/tmp/rpc_server.py");
-                vargs.add(imageName);
-                vargs.add("/tmp/rpc_server.py");
-                vargs.add("'" + defaultUser +"' '" + publicKey + "' '"+ masterHostname +"' '"+ masterIp + "'");
-                vargs.add("1>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stdout");
-                vargs.add("2>" + ApplicationConstants.LOG_DIR_EXPANSION_VAR + "/stderr");
-
-                StringBuilder command = new StringBuilder();
-                for (CharSequence str : vargs) {
-                    command.append(str).append(" ");
-                }
-
-                // Launch container by create ContainerLaunchContext
-                ContainerLaunchContext ctx = Records.newRecord(ContainerLaunchContext.class);
-                ctx.setLocalResources(localResources);
-                ctx.setTokens(allTokens.duplicate());
-                ctx.setCommands(Collections.singletonList(command.toString()));
-
-                logger("Launching container " + containerId);
-
-                try {
-                    nmClient.startContainer(container, ctx);
-                } catch (YarnException | IOException e) {
-                    e.printStackTrace();
-                }
-
-                YarnTask yt = new YarnTask(workerId, ctx,
-                        containerId,
-                        container.getNodeId().toString());
-
-                startedContainer++;
-                tasks.put(workerId, yt);
-
             }
         }
 
         return containerId;
     }
 
-    private String getRPCServerFile() {
-        String filepath = "/tmp/rpc_server_"+ UUID.randomUUID().toString()+".py";
-        InputStream inputStream = getClass().getResourceAsStream("/rpc/rpc_server.py");
-        FileOutputStream outputStream = null;
-        try {
-            outputStream = new FileOutputStream(new File(filepath));
-            IOUtils.copy(inputStream, outputStream);
-        } catch (IOException e) {
-            e.printStackTrace();
-        }finally {
-            IOUtils.closeQuietly(inputStream);
-            IOUtils.closeQuietly(outputStream);
-        }
-
-        return filepath;
-    }
-
-
     /**
      * Wait for task with identifier to reach RUNNING state. If state is not reached, task is removed from pending and
      * running tasks.
      *
-     * @param id Task identifier to wait for.
      * @param timeout Timeout in seconds.
+     * @param id Task identifier to wait for.
      * @throws FrameworkException if waits for timeout units.
      */
     public String waitTask(int timeout, String id) throws FrameworkException {
@@ -328,13 +302,14 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
 
         waitDockerContainerIsReady(task);
 
+        String nmHost = task.getNodeId().split(":")[0];
         String nmPort = System.getenv("NM_HTTP_PORT");
-        String nmHost = System.getenv("NM_HOST");
 
-        String url = "http:///" + nmHost + ":" + nmPort +
+        String url = "http://" + nmHost + ":" + nmPort +
                 "/ws/v1/node/containerlogs/" + task.getContainerId() + "/stdout";
 
-        while (!result.contains("ip:")) {
+        logger("Getting log from:  "+ url);
+        while (!result.contains("ready")) {
             Runtime rt = Runtime.getRuntime();
             Process pr = null;
             try {
@@ -348,16 +323,14 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
                     .lines()
                     .collect(Collectors.joining("\n"));
         }
+        logger("Log received from: "+ url);
 
-        Pattern pattern = Pattern.compile("ip:.*\n", Pattern.CASE_INSENSITIVE);
+        Pattern pattern = Pattern.compile("worker is starting\n.*\n.*\nworker is ready", Pattern.CASE_INSENSITIVE);
         Matcher matcher = pattern.matcher(result);
         boolean matchFound = matcher.find();
 
         if (matchFound) {
-            ip = matcher.group()
-                    .replace("ip:", "")
-                    .replace(" ", "")
-                    .replace("\n", "");
+            ip = matcher.group().split("\n")[2].split(" ")[0];
 
             task.setIp(ip);
             logger("Container is ready with ip " + ip);
@@ -370,7 +343,7 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         return ip;
     }
 
-    public void waitDockerContainerIsReady(YarnTask task) throws FrameworkException {
+    public void waitDockerContainerIsReady(YarnTask task) {
         logger("Checking if Yarn container is running");
 
         String nodeId = task.getNodeId();
@@ -378,24 +351,28 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         NodeId node = NodeId.fromString(nodeId);
 
         ContainerStatus cs = null;
+        boolean isReady = false;
+        int retry = 0;
+
         try {
-            cs = nmClient.getContainerStatus(container, node);
-
-            boolean isReady = cs.getState().equals(ContainerState.RUNNING);
-
-            int retry = 0;
             while (!isReady){
-                retry++;
-                if (retry % 100 == 0)
-                    logger("Waiting Docker Container (" + task.getId() + ") - retry: " + retry);
                 cs = nmClient.getContainerStatus(container, node);
+
                 isReady = cs.getState().equals(ContainerState.RUNNING);
+                retry++;
+
+                if (retry % 1000 == 0){
+                    logger("Waiting Docker Container (" + task.getId() + ") - retry: " + retry);
+                    logger(cs.getDiagnostics());
+                }
             }
+
         } catch (YarnException | IOException e) {
-            throw new FrameworkException("Yarn Connector failed to check status of Yarn container " +
+            logger("Yarn Connector failed to check status of Yarn container " +
                     container.toString());
         }
 
+        logger("Yarn container is running");
     }
 
     /**
@@ -417,13 +394,13 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
      * @param timeout Timeout in seconds.
      * @throws FrameworkException if task does not exist.
      */
-    public boolean removeTask(int timeout, String id) throws FrameworkException {
+    public String removeTask(int timeout, String id) throws FrameworkException {
 
         // Task still in pending queue, not launched to run in Yarn
         if (pendingTasks.contains(id)) {
             logger("Task still in pending queue, not launched to run in Yarn");
             pendingTasks.remove(id);
-            return false;
+            return "";
 
         } else if (!tasks.containsKey(id)) {
             runningTasks.remove(id);
@@ -434,37 +411,18 @@ public class YarnApplicationMaster implements YarnApplicationMasterInterface {
         String nodeId = task.getNodeId();
         String containerId = task.getContainerId();
 
-        // stopping Docker Container
-        Runtime rt = Runtime.getRuntime();
-        Process pr = null;
+        // stopping Yarn Container
         try {
-            pr = rt.exec("docker rm -f " + id);
-
-        } catch (IOException e) {
-            throw new FrameworkException("Yarn Connector failed to remove docker container named " + id);
+            nmClient.stopContainer(ContainerId.fromString(containerId), NodeId.fromString(nodeId));
+        } catch (YarnException | IOException e) {
+            throw new FrameworkException("Yarn Connector failed to stop Yarn container with id " + containerId);
         }
 
-        String result = new BufferedReader(
-                new InputStreamReader(pr.getInputStream()))
-                .lines()
-                .collect(Collectors.joining("\n"));
+        String hostContainer = task.getNodeId().split(":")[0];
+        tasks.remove(id);
+        logger("Docker Container (" + id + ") is removed.");
 
-
-        if (result.equals(id)){
-            logger("Docker Container (" + id + ") is removed.");
-
-            // stopping Yarn Container
-            try {
-                nmClient.stopContainer(ContainerId.fromString(containerId), NodeId.fromString(nodeId));
-            } catch (YarnException | IOException e) {
-                throw new FrameworkException("Yarn Connector failed to stop Yarn container with id " + containerId);
-            }
-
-            tasks.remove(id);
-            return true;
-        }
-
-        return false;
+        return hostContainer;
     }
 
     public static String getServerAddress(){

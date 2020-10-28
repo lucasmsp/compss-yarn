@@ -9,7 +9,7 @@
 		</Endpoint>
 
 		<Images>
-			<Image Name="lucasmsp/compss2.6:latest">
+			<Image Name="lucasmsp/compss:2.6">
 				<CreationTime>1800</CreationTime>
 				<Adaptors>
 					<Adaptor Name="es.bsc.compss.nio.master.NIOAdaptor">

@@ -22,18 +22,28 @@ public class YarnTask {
     private ContainerLaunchContext ctx;
     private String nodeId;
     private String containerId;
+    private String userVM;
 
 
     /**
      * Represents a Task to execute in Yarn.
      *
-     * @param id           Identifier.
+     * @param id Identifier.
      */
-    public YarnTask(String id, ContainerLaunchContext ctx, String containerId, String nodeId) {
+    public YarnTask(String id, ContainerLaunchContext ctx, String containerId, String nodeId, String userVM) {
         this.id = id;
         this.ctx = ctx;
         this.containerId = containerId;
         this.nodeId = nodeId;
+        this.userVM = userVM;
+    }
+
+    public String getUserVM() {
+        return userVM;
+    }
+
+    public void setUserVM(String userVM) {
+        this.userVM = userVM;
     }
 
     /**
@@ -67,11 +77,11 @@ public class YarnTask {
     }
 
     /**
-     * @return MesosTask string.
+     * @return YarnTask string.
      */
     @Override
     public String toString() {
-        return String.format("[Task %s] is running in container %s by node %d", id, containerId, nodeId);
+        return String.format("[Task %s] is running in container %s by node %s", id, containerId, nodeId);
     }
 
 
